@@ -391,12 +391,29 @@ class MnemosyneManual(Star):
     async def madd_cmd(self, event: AstrMessageEvent, text: str):
         """手动向 Mnemosyne 的记忆数据库中插入一条记忆。
 
-        使用示例: /madd 这是一条手动记忆内容
+        使用示例: /madd <Felis Abyssalis 喜欢在深夜调试代码>
         """
-        if not text or not text.strip():
+        # 从原始消息中提取 <> 之间的内容
+        raw_text = event.message_str if hasattr(event, "message_str") else ""
+        
+        import re
+        match = re.search(r"<(.+?)>", raw_text, re.DOTALL)
+        
+        if not match:
+            # 没有用 <> 包裹，给出提示
             yield event.plain_result(
                 "用法: /madd <记忆文本>\n"
-                "示例: /madd Felis Abyssalis 喜欢在深夜调试代码"
+                "请用 < > 包裹记忆内容\n"
+                "示例: /madd <Felis Abyssalis 喜欢在深夜调试代码>"
+            )
+            return
+
+        memory_text = match.group(1).strip()
+
+        if not memory_text:
+            yield event.plain_result(
+                "用法: /madd <记忆文本>\n"
+                "示例: /madd <Felis Abyssalis 喜欢在深夜调试代码>"
             )
             return
 
@@ -409,7 +426,7 @@ class MnemosyneManual(Star):
         yield event.plain_result("正在插入记忆...")
 
         result = await self.insert_memory(
-            text=text.strip(),
+            text=memory_text,
             session_id=session_id,
         )
 
@@ -418,7 +435,7 @@ class MnemosyneManual(Star):
             yield event.plain_result(
                 f"记忆插入成功\n"
                 f"ID: {memory_id}\n"
-                f"内容: {text.strip()[:100]}{'...' if len(text.strip()) > 100 else ''}"
+                f"内容: {memory_text[:100]}{'...' if len(memory_text) > 100 else ''}"
             )
         else:
             yield event.plain_result(f"记忆插入失败: {result['message']}")
