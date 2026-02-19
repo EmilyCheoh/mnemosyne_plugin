@@ -1,0 +1,68 @@
+{
+    "milvus_lite_path": {
+        "description": "Milvus Lite 数据库路径（必须与 Mnemosyne 插件的配置一致）",
+        "type": "string",
+        "hint": "填写与 Mnemosyne 插件相同的 milvus_lite_path，确保写入同一个数据库文件。留空则使用默认路径",
+        "obvious_hint": true,
+        "default": "",
+        "minLength": 0
+    },
+    "address": {
+        "description": "Milvus 数据库地址（必须与 Mnemosyne 插件的配置一致）",
+        "type": "string",
+        "hint": "如果 Mnemosyne 使用的是远程 Milvus（非 Lite 模式），请填写相同的地址。支持格式: http://localhost:19530",
+        "obvious_hint": true,
+        "default": "",
+        "minLength": 0
+    },
+    "authentication": {
+        "description": "Milvus 数据库认证信息（与 Mnemosyne 一致）",
+        "type": "object",
+        "hint": "如果 Milvus 开启了认证，请填写与 Mnemosyne 相同的认证信息",
+        "obvious_hint": true,
+        "items": {
+            "token": {
+                "description": "Milvus 认证 token",
+                "type": "string",
+                "hint": "token 优先于账户密码",
+                "obvious_hint": true,
+                "minLength": 0
+            },
+            "user": {
+                "description": "Milvus 认证用户名",
+                "type": "string",
+                "minLength": 0
+            },
+            "password": {
+                "description": "Milvus 认证密码",
+                "type": "string",
+                "minLength": 0
+            }
+        }
+    },
+    "collection_name": {
+        "description": "向量数据库集合名称（必须与 Mnemosyne 插件的配置一致）",
+        "type": "string",
+        "hint": "填写与 Mnemosyne 插件相同的 collection_name，确保写入同一个集合",
+        "obvious_hint": true,
+        "default": "mnemosyne_default",
+        "pattern": "^[a-zA-Z][a-zA-Z0-9_]*$",
+        "minLength": 1,
+        "maxLength": 64
+    },
+    "embedding_provider_id": {
+        "description": "Embedding 服务提供商（建议与 Mnemosyne 一致）",
+        "type": "string",
+        "hint": "选择与 Mnemosyne 相同的 Embedding Provider，确保向量维度和语义空间一致。留空则使用 AstrBot 中配置的第一个 Embedding Provider",
+        "_special": "select_embedding_provider",
+        "default": ""
+    },
+    "default_persona_id": {
+        "description": "默认人格 ID",
+        "type": "string",
+        "hint": "手动插入记忆时使用的默认人格 ID。如果你在 Mnemosyne 中配置了人格过滤，这里需要填写对应的人格名称",
+        "obvious_hint": true,
+        "default": "UNKNOWN_PERSONA",
+        "minLength": 1
+    }
+}

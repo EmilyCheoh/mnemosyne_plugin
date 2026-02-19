@@ -1,0 +1,6 @@
+name: astrbot_plugin_mnemosyne_manual
+desc: Mnemosyne 手动记忆注入插件 - 直接向 Mnemosyne 的向量数据库插入手动编写的记忆条目
+help: 输入 /madd <文本> 手动插入一条记忆
+version: v1.0.0
+author: FelisAbyssalis
+repo: ""
