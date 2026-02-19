@@ -3,14 +3,14 @@ MnemosyneManual - Mnemosyne 手动记忆注入伴生插件
 直接向 Mnemosyne 的 Milvus 向量数据库中插入手动编写的记忆条目。
 插入的记录与 Mnemosyne 自动生成的记录格式完全一致，
 使 Mnemosyne 在检索时能正常 fetch 到手动插入的记忆。
+
+核心策略：不自建 Milvus 连接，直接借用 Mnemosyne 已建立的连接。
+两个插件运行在同一个 AstrBot 进程中，共享 pymilvus 连接池。
 """
 
 import asyncio
-import os
-import platform
 import time
 from typing import Any, cast
-from urllib.parse import urlparse
 
 from astrbot.api import AstrBotConfig, logger
 from astrbot.api.event import AstrMessageEvent, filter
@@ -19,9 +19,6 @@ from astrbot.core.provider.provider import EmbeddingProvider
 
 from pymilvus import (
     Collection,
-    CollectionSchema,
-    DataType,
-    FieldSchema,
     MilvusException,
     connections,
     utility,
@@ -30,11 +27,12 @@ from pymilvus import (
 # ---------------------------------------------------------------------------
 # Mnemosyne 兼容常量（必须与 Mnemosyne core/constants.py 完全一致）
 # ---------------------------------------------------------------------------
-DEFAULT_COLLECTION_NAME = "mnemosyne_default"
-DEFAULT_EMBEDDING_DIM = 1024
 VECTOR_FIELD_NAME = "embedding"
 PRIMARY_FIELD_NAME = "memory_id"
 DEFAULT_PERSONA_ON_NONE = "UNKNOWN_PERSONA"
+
+# Mnemosyne 的 MilvusManager 默认使用 "default" 作为连接别名
+MNEMOSYNE_CONNECTION_ALIAS = "default"
 
 
 @register(
@@ -47,8 +45,12 @@ DEFAULT_PERSONA_ON_NONE = "UNKNOWN_PERSONA"
 class MnemosyneManual(Star):
     """
     AstrBot 伴生插件：为 Mnemosyne 提供手动记忆插入能力。
-    共享 Mnemosyne 的 Milvus 数据库、集合和 Embedding 模型，
-    以完全兼容的数据格式写入记忆记录。
+
+    核心设计：不自建 Milvus 连接，直接借用同进程中 Mnemosyne 插件
+    已经建立的 pymilvus 连接（别名 "default"）。这样可以：
+    1. 避免 Milvus Lite 多连接隔离问题
+    2. 保证读写同一个数据库实例
+    3. 简化配置（不需要再配置数据库路径）
     """
 
     def __init__(self, context: Context, config: AstrBotConfig):
@@ -57,153 +59,51 @@ class MnemosyneManual(Star):
         self.context = context
 
         # --- 组件状态 ---
-        self.collection_name: str = DEFAULT_COLLECTION_NAME
+        self.collection_name: str = "default"
         self.embedding_provider: EmbeddingProvider | None = None
         self._embedding_provider_ready = False
-        self._warned_missing_provider_ids: set[str] = set()
-        self._milvus_connected = False
-        self._milvus_alias: str = "mnemosyne_manual"
-        self._milvus_uri: str | None = None
-        self._is_lite: bool = False
-        self.plugin_data_dir: str | None = None
 
         logger.info("开始初始化 MnemosyneManual 插件...")
-        asyncio.create_task(self._initialize_plugin_async())
+
+        # 读取集合名称
+        self.collection_name = self.config.get("collection_name", "default")
+        logger.info(f"MnemosyneManual 将写入集合: '{self.collection_name}'")
+        logger.info("MnemosyneManual 插件基础初始化完成（将在 AstrBot 加载后连接 Milvus）")
 
     # -----------------------------------------------------------------------
-    # 初始化
+    # Milvus 连接（借用 Mnemosyne 的）
     # -----------------------------------------------------------------------
 
-    async def _initialize_plugin_async(self):
-        """非阻塞异步初始化流程。"""
+    def _check_mnemosyne_connection(self) -> bool:
+        """
+        检查 Mnemosyne 的 pymilvus 连接是否可用。
+        Mnemosyne 使用别名 "default" 建立连接。
+        """
         try:
-            # 1. 获取插件数据目录
-            try:
-                from astrbot.api.star import StarTools
-                plugin_data_dir = StarTools.get_data_dir()
-                self.plugin_data_dir = str(plugin_data_dir) if plugin_data_dir else None
-                logger.info(f"MnemosyneManual 数据目录: {self.plugin_data_dir}")
-            except Exception as e:
-                logger.warning(f"无法获取插件数据目录: {e}")
-                self.plugin_data_dir = None
+            # 检查 pymilvus 连接池中是否存在 Mnemosyne 的连接
+            existing = connections.list_connections()
+            for alias, _ in existing:
+                if alias == MNEMOSYNE_CONNECTION_ALIAS:
+                    # 验证连接是否真的活跃
+                    try:
+                        # 尝试列出集合来验证连接可用性
+                        utility.list_collections(using=MNEMOSYNE_CONNECTION_ALIAS)
+                        return True
+                    except Exception:
+                        logger.warning(
+                            f"连接别名 '{MNEMOSYNE_CONNECTION_ALIAS}' 存在但不可用"
+                        )
+                        return False
 
-            # 2. 读取集合名称
-            self.collection_name = self.config.get(
-                "collection_name", DEFAULT_COLLECTION_NAME
+            logger.warning(
+                "未找到 Mnemosyne 的 Milvus 连接。"
+                "请确保 Mnemosyne 插件已安装并启用，且 Milvus 已初始化"
             )
-            logger.info(
-                f"MnemosyneManual 将写入集合: '{self.collection_name}'"
-            )
-
-            # 3. 配置 Milvus 连接（延迟连接）
-            self._configure_milvus()
-
-            # 4. Embedding Provider 延迟初始化
-            logger.info("Embedding Provider 将在首次使用时加载")
-
-            logger.info("MnemosyneManual 插件基础初始化完成")
-
-        except Exception as e:
-            logger.error(
-                f"MnemosyneManual 初始化失败: {e}", exc_info=True
-            )
-
-    def _configure_milvus(self):
-        """根据配置确定 Milvus 连接参数（不立即连接）。"""
-        is_windows = platform.system() == "Windows"
-        lite_path = self.config.get("milvus_lite_path", "") if not is_windows else ""
-        milvus_address = self.config.get("address", "")
-
-        if lite_path:
-            # Milvus Lite 模式
-            self._is_lite = True
-            # 解析路径
-            if self.plugin_data_dir and not os.path.isabs(lite_path):
-                full_path = os.path.join(self.plugin_data_dir, lite_path)
-            else:
-                full_path = lite_path
-            if not full_path.endswith(".db"):
-                full_path = os.path.join(full_path, "mnemosyne_lite.db")
-            # 确保目录存在
-            db_dir = os.path.dirname(full_path)
-            if db_dir and not os.path.exists(db_dir):
-                os.makedirs(db_dir, exist_ok=True)
-            self._milvus_uri = full_path
-            logger.info(f"MnemosyneManual 将使用 Milvus Lite: {full_path}")
-
-        elif milvus_address:
-            # 标准 Milvus
-            self._is_lite = False
-            if milvus_address.startswith(("http://", "https://")):
-                self._milvus_uri = milvus_address
-            else:
-                self._milvus_uri = f"http://{milvus_address}"
-            logger.info(
-                f"MnemosyneManual 将使用标准 Milvus: {self._milvus_uri}"
-            )
-
-        else:
-            # 默认 Milvus Lite
-            self._is_lite = True
-            if self.plugin_data_dir:
-                # 使用与 Mnemosyne 相同的默认路径逻辑
-                # Mnemosyne 的默认路径是 plugin_data_dir/mnemosyne_lite.db
-                # 但由于我们是不同的插件，数据目录不同
-                # 用户必须显式配置 milvus_lite_path 来指向 Mnemosyne 的数据库
-                logger.warning(
-                    "未配置 milvus_lite_path 和 address，"
-                    "请在插件配置中填写与 Mnemosyne 相同的 milvus_lite_path，"
-                    "否则将无法访问 Mnemosyne 的记忆数据库"
-                )
-                default_path = os.path.join(
-                    self.plugin_data_dir, "mnemosyne_lite.db"
-                )
-                self._milvus_uri = default_path
-            else:
-                logger.error("无法确定 Milvus 数据库路径")
-                self._milvus_uri = None
-
-    def _connect_milvus(self) -> bool:
-        """建立 Milvus 连接。返回是否成功。"""
-        if self._milvus_connected:
-            return True
-
-        if not self._milvus_uri:
-            logger.error("Milvus URI 未配置，无法连接")
             return False
 
-        connect_params: dict[str, Any] = {"uri": self._milvus_uri}
-
-        # 添加认证信息（仅标准 Milvus）
-        if not self._is_lite:
-            auth_config = self.config.get("authentication", {})
-            if isinstance(auth_config, dict):
-                if auth_config.get("token"):
-                    connect_params["token"] = auth_config["token"]
-                elif auth_config.get("user") and auth_config.get("password"):
-                    connect_params["user"] = auth_config["user"]
-                    connect_params["password"] = auth_config["password"]
-
-        mode_name = "Milvus Lite" if self._is_lite else "标准 Milvus"
-        logger.info(
-            f"MnemosyneManual 正在连接 {mode_name} "
-            f"(别名: {self._milvus_alias})..."
-        )
-        try:
-            connections.connect(alias=self._milvus_alias, **connect_params)
-            self._milvus_connected = True
-            logger.info(f"MnemosyneManual 成功连接到 {mode_name}")
-            return True
         except Exception as e:
-            logger.error(f"MnemosyneManual 连接 {mode_name} 失败: {e}")
-            self._milvus_connected = False
+            logger.error(f"检查 Mnemosyne 连接时出错: {e}")
             return False
-
-    def _ensure_connected(self) -> bool:
-        """确保 Milvus 已连接。"""
-        if self._milvus_connected:
-            return True
-        return self._connect_milvus()
 
     # -----------------------------------------------------------------------
     # Embedding Provider
@@ -228,8 +128,11 @@ class MnemosyneManual(Star):
                 except (AttributeError, TypeError):
                     pass
 
-                if provider is None and not hasattr(self.context, "provider_manager"):
-                    provider = self.context.get_provider_by_id(emb_id)
+                if provider is None:
+                    try:
+                        provider = self.context.get_provider_by_id(emb_id)
+                    except Exception:
+                        pass
 
                 if provider and (
                     callable(getattr(provider, "embed_texts", None))
@@ -241,16 +144,19 @@ class MnemosyneManual(Star):
                     return cast(EmbeddingProvider, provider)
 
             # 优先级 2: 框架默认
-            embedding_providers = self.context.get_all_embedding_providers()
-            if embedding_providers and len(embedding_providers) > 0:
-                provider = embedding_providers[0]
-                provider_id = getattr(provider, "provider_config", {}).get(
-                    "id", "unknown"
-                )
-                logger.info(
-                    f"MnemosyneManual 使用默认 Embedding Provider: {provider_id}"
-                )
-                return cast(EmbeddingProvider, provider)
+            try:
+                embedding_providers = self.context.get_all_embedding_providers()
+                if embedding_providers and len(embedding_providers) > 0:
+                    provider = embedding_providers[0]
+                    provider_id = getattr(provider, "provider_config", {}).get(
+                        "id", "unknown"
+                    )
+                    logger.info(
+                        f"MnemosyneManual 使用默认 Embedding Provider: {provider_id}"
+                    )
+                    return cast(EmbeddingProvider, provider)
+            except Exception as e:
+                logger.debug(f"获取默认 Embedding Provider 失败: {e}")
 
             logger.warning("MnemosyneManual: 没有可用的 Embedding Provider")
             return None
@@ -301,21 +207,33 @@ class MnemosyneManual(Star):
                 "message": f"记忆文本过长 ({len(text)} 字符)，最大 4096 字符",
             }
 
-        # 确保 Milvus 连接
-        if not self._ensure_connected():
-            return {"success": False, "message": "Milvus 数据库连接失败"}
+        # 检查 Mnemosyne 的连接是否可用
+        if not self._check_mnemosyne_connection():
+            return {
+                "success": False,
+                "message": (
+                    "无法连接到 Milvus 数据库。"
+                    "请确保 Mnemosyne 插件已启用并且 Milvus 已初始化 (/memory init)"
+                ),
+            }
 
         # 确保集合存在
         try:
             has_collection = utility.has_collection(
-                self.collection_name, using=self._milvus_alias
+                self.collection_name, using=MNEMOSYNE_CONNECTION_ALIAS
             )
             if not has_collection:
+                # 列出所有可用集合帮助调试
+                all_collections = utility.list_collections(
+                    using=MNEMOSYNE_CONNECTION_ALIAS
+                )
                 return {
                     "success": False,
                     "message": (
                         f"集合 '{self.collection_name}' 不存在。"
-                        "请先在 Mnemosyne 中执行 /memory init 创建集合"
+                        f"当前可用集合: {all_collections}。"
+                        "请先在 Mnemosyne 中执行 /memory init 创建集合，"
+                        "或检查集合名称配置是否与 Mnemosyne 一致"
                     ),
                 }
         except Exception as e:
@@ -360,10 +278,10 @@ class MnemosyneManual(Star):
             }
         ]
 
-        # --- 插入 Milvus ---
+        # --- 插入 Milvus（使用 Mnemosyne 的连接）---
         try:
             collection = Collection(
-                name=self.collection_name, using=self._milvus_alias
+                name=self.collection_name, using=MNEMOSYNE_CONNECTION_ALIAS
             )
             collection.load()
 
@@ -417,9 +335,11 @@ class MnemosyneManual(Star):
 
     @filter.on_astrbot_loaded()
     async def on_astrbot_loaded(self):
-        """AstrBot 初始化完成后，尝试加载 Embedding Provider 并连接 Milvus。"""
+        """AstrBot 初始化完成后，尝试加载 Embedding Provider。"""
         try:
             logger.info("MnemosyneManual: AstrBot 已加载，开始初始化组件...")
+
+            # 加载 Embedding Provider
             self.embedding_provider = self._get_embedding_provider()
             if self.embedding_provider:
                 self._embedding_provider_ready = True
@@ -430,8 +350,19 @@ class MnemosyneManual(Star):
                     "将在首次使用时重试"
                 )
 
-            # 尝试建立 Milvus 连接
-            self._connect_milvus()
+            # 验证 Mnemosyne 连接
+            if self._check_mnemosyne_connection():
+                logger.info("MnemosyneManual: 成功借用 Mnemosyne 的 Milvus 连接")
+                # 列出集合验证
+                collections = utility.list_collections(
+                    using=MNEMOSYNE_CONNECTION_ALIAS
+                )
+                logger.info(f"MnemosyneManual: 可用集合: {collections}")
+            else:
+                logger.warning(
+                    "MnemosyneManual: Mnemosyne 的 Milvus 连接尚不可用，"
+                    "将在首次使用 /madd 时重试"
+                )
 
         except Exception as e:
             logger.error(
@@ -484,12 +415,5 @@ class MnemosyneManual(Star):
 
     async def terminate(self):
         """插件停止时清理资源。"""
-        logger.info("MnemosyneManual 正在停止...")
-        if self._milvus_connected:
-            try:
-                connections.disconnect(self._milvus_alias)
-                self._milvus_connected = False
-                logger.info("MnemosyneManual: Milvus 连接已断开")
-            except Exception as e:
-                logger.error(f"MnemosyneManual 断开 Milvus 连接时出错: {e}")
+        # 我们不需要清理任何连接，因为连接属于 Mnemosyne
         logger.info("MnemosyneManual 插件已停止")
