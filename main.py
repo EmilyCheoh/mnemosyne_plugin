@@ -76,27 +76,42 @@ class MnemosyneManual(Star):
     def _check_mnemosyne_connection(self) -> bool:
         """
         检查 Mnemosyne 的 pymilvus 连接是否可用。
-        Mnemosyne 使用别名 "default" 建立连接。
+        自动探测正确的连接别名。
         """
         try:
-            # 检查 pymilvus 连接池中是否存在 Mnemosyne 的连接
             existing = connections.list_connections()
+            all_aliases = [alias for alias, _ in existing]
+            logger.info(
+                f"MnemosyneManual: 当前 pymilvus 连接池中的所有别名: {all_aliases}"
+            )
+
+            if not all_aliases:
+                logger.warning("pymilvus 连接池为空，Mnemosyne 可能尚未初始化")
+                return False
+
+            # 策略：尝试每个连接别名，找到包含我们目标集合的那个
             for alias, _ in existing:
-                if alias == self._mnemosyne_alias:
-                    # 验证连接是否真的活跃
-                    try:
-                        # 尝试列出集合来验证连接可用性
-                        utility.list_collections(using=self._mnemosyne_alias)
-                        return True
-                    except Exception:
-                        logger.warning(
-                            f"连接别名 '{self._mnemosyne_alias}' 存在但不可用"
+                try:
+                    collections_list = utility.list_collections(using=alias)
+                    logger.info(
+                        f"MnemosyneManual: 别名 '{alias}' 可用，包含集合: {collections_list}"
+                    )
+                    if self.collection_name in collections_list:
+                        logger.info(
+                            f"MnemosyneManual: 找到目标集合 '{self.collection_name}' "
+                            f"在连接别名 '{alias}' 中"
                         )
-                        return False
+                        self._mnemosyne_alias = alias  # 更新为正确的别名
+                        return True
+                except Exception as e:
+                    logger.debug(
+                        f"MnemosyneManual: 别名 '{alias}' 不可用: {e}"
+                    )
+                    continue
 
             logger.warning(
-                "未找到 Mnemosyne 的 Milvus 连接。"
-                "请确保 Mnemosyne 插件已安装并启用，且 Milvus 已初始化"
+                f"MnemosyneManual: 在所有可用连接中未找到集合 '{self.collection_name}'。"
+                "请确保 Mnemosyne 插件已启用并且 Milvus 已初始化 (/memory init)"
             )
             return False
 
