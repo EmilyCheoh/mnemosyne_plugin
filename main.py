@@ -31,8 +31,6 @@ VECTOR_FIELD_NAME = "embedding"
 PRIMARY_FIELD_NAME = "memory_id"
 DEFAULT_PERSONA_ON_NONE = "UNKNOWN_PERSONA"
 
-# Mnemosyne 的 MilvusManager 默认使用 "default" 作为连接别名
-MNEMOSYNE_CONNECTION_ALIAS = "default"
 
 
 @register(
@@ -59,15 +57,16 @@ class MnemosyneManual(Star):
         self.context = context
 
         # --- 组件状态 ---
-        self.collection_name: str = "default"
+        self.collection_name: str = self.config.get("collection_name", "default")
         self.embedding_provider: EmbeddingProvider | None = None
         self._embedding_provider_ready = False
 
-        logger.info("开始初始化 MnemosyneManual 插件...")
+        # Mnemosyne 的连接别名格式是 "mnemosyne_{collection_name}"
+        self._mnemosyne_alias: str = f"mnemosyne_{self.collection_name}"
 
-        # 读取集合名称
-        self.collection_name = self.config.get("collection_name", "default")
+        logger.info("开始初始化 MnemosyneManual 插件...")
         logger.info(f"MnemosyneManual 将写入集合: '{self.collection_name}'")
+        logger.info(f"MnemosyneManual 将借用 Mnemosyne 连接别名: '{self._mnemosyne_alias}'")
         logger.info("MnemosyneManual 插件基础初始化完成（将在 AstrBot 加载后连接 Milvus）")
 
     # -----------------------------------------------------------------------
@@ -83,15 +82,15 @@ class MnemosyneManual(Star):
             # 检查 pymilvus 连接池中是否存在 Mnemosyne 的连接
             existing = connections.list_connections()
             for alias, _ in existing:
-                if alias == MNEMOSYNE_CONNECTION_ALIAS:
+                if alias == self._mnemosyne_alias:
                     # 验证连接是否真的活跃
                     try:
                         # 尝试列出集合来验证连接可用性
-                        utility.list_collections(using=MNEMOSYNE_CONNECTION_ALIAS)
+                        utility.list_collections(using=self._mnemosyne_alias)
                         return True
                     except Exception:
                         logger.warning(
-                            f"连接别名 '{MNEMOSYNE_CONNECTION_ALIAS}' 存在但不可用"
+                            f"连接别名 '{self._mnemosyne_alias}' 存在但不可用"
                         )
                         return False
 
@@ -220,12 +219,12 @@ class MnemosyneManual(Star):
         # 确保集合存在
         try:
             has_collection = utility.has_collection(
-                self.collection_name, using=MNEMOSYNE_CONNECTION_ALIAS
+                self.collection_name, using=self._mnemosyne_alias
             )
             if not has_collection:
                 # 列出所有可用集合帮助调试
                 all_collections = utility.list_collections(
-                    using=MNEMOSYNE_CONNECTION_ALIAS
+                    using=self._mnemosyne_alias
                 )
                 return {
                     "success": False,
@@ -281,7 +280,7 @@ class MnemosyneManual(Star):
         # --- 插入 Milvus（使用 Mnemosyne 的连接）---
         try:
             collection = Collection(
-                name=self.collection_name, using=MNEMOSYNE_CONNECTION_ALIAS
+                name=self.collection_name, using=self._mnemosyne_alias
             )
             collection.load()
 
@@ -355,7 +354,7 @@ class MnemosyneManual(Star):
                 logger.info("MnemosyneManual: 成功借用 Mnemosyne 的 Milvus 连接")
                 # 列出集合验证
                 collections = utility.list_collections(
-                    using=MNEMOSYNE_CONNECTION_ALIAS
+                    using=self._mnemosyne_alias
                 )
                 logger.info(f"MnemosyneManual: 可用集合: {collections}")
             else:
